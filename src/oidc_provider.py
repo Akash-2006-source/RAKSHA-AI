@@ -69,7 +69,7 @@ def _load_or_create_rsa_key() -> RSAKey:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if KEY_FILE.exists():
         data = json.loads(KEY_FILE.read_text(encoding="utf-8"))
-        return RSAKey.import_dict(data)
+        return RSAKey.import_key(data)
     key = RSAKey.generate_key(2048, {"kid": KID, "use": "sig", "alg": "RS256"})
     KEY_FILE.write_text(json.dumps(key.as_dict(private=True), indent=2), encoding="utf-8")
     return key
