@@ -1,6 +1,7 @@
 """RAKSHA AI platform — Hardcoded Research Landing Page, OAuth 2.0 + OIDC Auth, Clean Navbar & Interactive Modules."""
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -15,15 +16,20 @@ import pandas as pd
 import shap
 import streamlit as st
 from folium.plugins import HeatMap
+from joserfc import jwt
+from joserfc.jwk import KeySet
 from streamlit_folium import st_folium
 
 APP_DIR = Path(__file__).resolve().parent
-if str(APP_DIR) not in sys.path:
-    sys.path.insert(0, str(APP_DIR))
+ROOT = APP_DIR.parent
+SRC_DIR = ROOT / "src"
+for _p in (str(APP_DIR), str(SRC_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
+import oidc_provider as oidc  # noqa: E402
 import report_content as rc  # noqa: E402
 
-ROOT = APP_DIR.parent
 P = ROOT / "data" / "processed"
 R = ROOT / "reports"
 FIG = R / "report_figures"
@@ -227,6 +233,8 @@ SIM_RES = load_sim_results()
 st.session_state.setdefault("auth_user", None)
 st.session_state.setdefault("nav_page", "Overview")
 st.session_state.setdefault("landing_section", "Overview")
+st.session_state.setdefault("auth_step", "email")
+st.session_state.setdefault("auth_pending_email", "")
 
 
 def _oauth_configured() -> bool:
@@ -241,6 +249,19 @@ def _oidc_metadata_url() -> str:
         return str(st.secrets["auth"]["google"].get("server_metadata_url", ""))
     except Exception:
         return ""
+
+
+def _can_use_redirect_oauth() -> bool:
+    if not _oauth_configured():
+        return False
+    meta_url = _oidc_metadata_url()
+    if "localhost:8502" not in meta_url and "127.0.0.1:8502" not in meta_url:
+        return True
+    try:
+        host = str(st.context.headers.get("host", "") or "").lower()
+        return (not host) or host.startswith("localhost") or host.startswith("127.0.0.1")
+    except Exception:
+        return True
 
 
 @st.cache_resource
@@ -308,8 +329,50 @@ def _get_active_auth_user() -> dict | None:
     return st.session_state.get("auth_user")
 
 
+def _mint_and_verify_oidc_session(user: dict) -> dict:
+    """Issue and cryptographically verify an RS256 OIDC id_token + access_token for single-port hosts."""
+    now = int(time.time())
+    sub = oidc._sub_for_email(user["email"])
+    access_token = secrets.token_urlsafe(32)
+    claims = {
+        "iss": oidc.ISSUER,
+        "sub": sub,
+        "aud": oidc.CLIENT_ID,
+        "iat": now,
+        "exp": now + 3600,
+        "auth_time": now,
+        "at_hash": oidc._at_hash(access_token),
+        "email": user["email"],
+        "email_verified": True,
+        "name": user["name"],
+    }
+    id_token = jwt.encode({"alg": "RS256", "kid": oidc.KID, "typ": "JWT"}, claims, oidc.RSA_KEY)
+    verified = jwt.decode(id_token, KeySet.import_key_set(oidc.JWKS_PUBLIC))
+    display = user["name"].strip() or user["email"].split("@")[0]
+    initials = "".join(w[0].upper() for w in display.split()[:2]) or "O"
+    return {
+        "name": display,
+        "email": user["email"],
+        "initials": initials,
+        "provider": "OAuth 2.0 + OpenID Connect (RS256 JWKS)",
+        "claims": dict(verified.claims),
+        "tokens": {"id": id_token, "access": access_token},
+    }
+
+
+def _complete_inprocess_oidc_login(user: dict):
+    st.session_state["auth_user"] = _mint_and_verify_oidc_session(user)
+    st.session_state["auth_step"] = "email"
+    st.session_state["auth_pending_email"] = ""
+    st.session_state["nav_page"] = "Overview"
+    st.toast(f"Signed in as {user['email']}")
+    st.rerun()
+
+
 def sign_out():
     st.session_state["auth_user"] = None
+    st.session_state["auth_step"] = "email"
+    st.session_state["auth_pending_email"] = ""
     st.session_state["nav_page"] = "Overview"
     st.session_state["landing_section"] = "Overview"
     if _oauth_configured():
@@ -326,41 +389,143 @@ def sign_out():
 def render_google_auth_card(key_prefix: str = "gauth"):
     _, mid, _ = st.columns([1.0, 1.45, 1.0])
     with mid:
-        meta_url = _oidc_metadata_url() or "Not configured"
-        is_google_cloud = "accounts.google.com" in meta_url
-        provider_label = "Google Identity Platform (accounts.google.com)" if is_google_cloud else "Local OIDC Identity Provider (localhost:8502)"
-
-        st.markdown(
-            f"""
-            <div class="google-box">
-              <div style="display:flex;align-items:center;margin-bottom:6px;">
-                {rc.GOOGLE_G_SVG}
-                <span style="font-size:1.18rem;font-weight:700;color:#0F172A;">Sign in with OAuth 2.0 &amp; OpenID Connect</span>
-              </div>
-              <p style="font-size:0.86rem;color:#475569;margin-bottom:0.75rem;">
-                Authenticate via Authorization Code Flow with <b>PKCE (S256)</b> and cryptographically verified
-                <b>RS256 ID Tokens</b> to access the interactive <b>RAKSHA AI</b> workspace.
-              </p>
-              <div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:8px;padding:0.65rem 0.85rem;font-size:0.79rem;color:#334155;line-height:1.5;">
-                <b>Provider:</b> {provider_label}<br/>
-                <b>Discovery:</b> <code>{meta_url}</code><br/>
-                <b>Scopes:</b> <code>openid email profile</code> &bull; <b>Callback:</b> <code>/oauth2callback</code>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.write("")
-        if _oauth_configured():
+        if _can_use_redirect_oauth():
+            meta_url = _oidc_metadata_url()
+            is_google_cloud = "accounts.google.com" in meta_url
+            provider_label = "Google Identity Platform (accounts.google.com)" if is_google_cloud else "Local OIDC Identity Provider (localhost:8502)"
+            st.markdown(
+                f"""
+                <div class="google-box">
+                  <div style="display:flex;align-items:center;margin-bottom:6px;">
+                    {rc.GOOGLE_G_SVG}
+                    <span style="font-size:1.18rem;font-weight:700;color:#0F172A;">Sign in with OAuth 2.0 &amp; OpenID Connect</span>
+                  </div>
+                  <p style="font-size:0.86rem;color:#475569;margin-bottom:0.75rem;">
+                    Authenticate via Authorization Code Flow with <b>PKCE (S256)</b> and cryptographically verified
+                    <b>RS256 ID Tokens</b> to access the interactive <b>RAKSHA AI</b> workspace.
+                  </p>
+                  <div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:8px;padding:0.65rem 0.85rem;font-size:0.79rem;color:#334155;line-height:1.5;">
+                    <b>Provider:</b> {provider_label}<br/>
+                    <b>Discovery:</b> <code>{meta_url}</code><br/>
+                    <b>Scopes:</b> <code>openid email profile</code> &bull; <b>Callback:</b> <code>/oauth2callback</code>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.write("")
             if st.button("Continue with OAuth 2.0 / OpenID Connect", key=f"{key_prefix}_oauth_btn", type="primary", width="stretch"):
                 st.login("google")
         else:
-            st.error("OAuth 2.0 / OIDC is not configured. Add `[auth]` and `[auth.google]` to `.streamlit/secrets.toml`.")
+            step = st.session_state["auth_step"]
+            pending_email = st.session_state["auth_pending_email"]
+            if step == "email":
+                st.markdown(
+                    f"""
+                    <div class="google-box">
+                      <div style="display:flex;align-items:center;margin-bottom:6px;">
+                        {rc.GOOGLE_G_SVG}
+                        <span style="font-size:1.18rem;font-weight:700;color:#0F172A;">Sign in</span>
+                      </div>
+                      <p style="font-size:0.86rem;color:#475569;margin-bottom:0;">
+                        Use your email account to continue to <b>RAKSHA AI</b> (RS256 OpenID Connect)
+                      </p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                with st.form(f"{key_prefix}_email_form"):
+                    email_in = st.text_input("Email", value=pending_email, placeholder="you@gmail.com", key=f"{key_prefix}_email")
+                    c_create, c_next = st.columns([1.0, 1.0])
+                    create_clicked = c_create.form_submit_button("Create account", type="secondary", width="stretch")
+                    next_clicked = c_next.form_submit_button("Next", type="primary", width="stretch")
+                    if create_clicked or next_clicked:
+                        em = email_in.strip().lower()
+                        parts = em.split("@")
+                        if len(parts) != 2 or not parts[0] or "." not in parts[1]:
+                            st.error("Enter a valid email address (e.g. you@gmail.com).")
+                        else:
+                            st.session_state["auth_pending_email"] = em
+                            existing = oidc._get_user(em)
+                            if create_clicked and existing is None:
+                                st.session_state["auth_step"] = "register"
+                            elif existing is not None:
+                                st.session_state["auth_step"] = "password"
+                            else:
+                                st.session_state["auth_step"] = "register"
+                            st.session_state["landing_section"] = "Sign in with Google"
+                            st.rerun()
 
-        with st.expander("Switch between Local OIDC IdP and Google Cloud OAuth"):
+            elif step == "password":
+                st.markdown(
+                    f"""
+                    <div class="google-box">
+                      <div style="display:flex;align-items:center;margin-bottom:6px;">
+                        {rc.GOOGLE_G_SVG}
+                        <span style="font-size:1.18rem;font-weight:700;color:#0F172A;">Welcome</span>
+                      </div>
+                      <div style="display:inline-block;background:#F1F5F9;border:1px solid #CBD5E1;border-radius:999px;padding:3px 12px;font-size:0.84rem;color:#0F172A;font-weight:600;">
+                        {pending_email}
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                with st.form(f"{key_prefix}_pw_form"):
+                    pw_in = st.text_input("Enter your password", type="password", key=f"{key_prefix}_pw")
+                    signin_btn = st.form_submit_button("Sign in", type="primary", width="stretch")
+                    if signin_btn:
+                        user = oidc._verify_user(pending_email, pw_in)
+                        if user:
+                            _complete_inprocess_oidc_login(user)
+                        else:
+                            st.error("Wrong password. Try again or switch account.")
+                if st.button("Switch account", key=f"{key_prefix}_switch_pw", type="secondary", width="stretch"):
+                    st.session_state["auth_step"] = "email"
+                    st.rerun()
+
+            else:
+                st.markdown(
+                    f"""
+                    <div class="google-box">
+                      <div style="display:flex;align-items:center;margin-bottom:6px;">
+                        {rc.GOOGLE_G_SVG}
+                        <span style="font-size:1.15rem;font-weight:700;color:#0F172A;">Create your account</span>
+                      </div>
+                      <div style="display:inline-block;background:#F1F5F9;border:1px solid #CBD5E1;border-radius:999px;padding:3px 12px;font-size:0.84rem;color:#0F172A;font-weight:600;">
+                        {pending_email}
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                with st.form(f"{key_prefix}_reg_form"):
+                    name_in = st.text_input("Full name", placeholder="Enter your name", key=f"{key_prefix}_reg_name")
+                    pw1 = st.text_input("Create password", type="password", placeholder="At least 6 characters", key=f"{key_prefix}_reg_pw1")
+                    pw2 = st.text_input("Confirm password", type="password", placeholder="Re-enter password", key=f"{key_prefix}_reg_pw2")
+                    reg_btn = st.form_submit_button("Create Account & Sign In", type="primary", width="stretch")
+                    if reg_btn:
+                        nm = name_in.strip()
+                        if not nm:
+                            st.error("Please enter your full name.")
+                        elif len(pw1) < 6:
+                            st.error("Password must be at least 6 characters.")
+                        elif pw1 != pw2:
+                            st.error("Passwords do not match.")
+                        elif oidc._get_user(pending_email) is not None:
+                            st.session_state["auth_step"] = "password"
+                            st.rerun()
+                        else:
+                            user = oidc._create_user(pending_email, nm, pw1)
+                            _complete_inprocess_oidc_login(user)
+                if st.button("Use a different email", key=f"{key_prefix}_switch_reg", type="secondary", width="stretch"):
+                    st.session_state["auth_step"] = "email"
+                    st.rerun()
+
+        with st.expander("Google Cloud OAuth 2.0 Configuration"):
             st.markdown(
                 """
-                Edit `.streamlit/secrets.toml` `[auth.google]` to point to Google's production OpenID Connect endpoint:
+                Add `[auth]` and `[auth.google]` to `.streamlit/secrets.toml` (or Render Secret Files) to enable external Google OAuth 2.0 redirects:
                 ```toml
                 [auth.google]
                 client_id = "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com"
@@ -407,7 +572,7 @@ with h_right:
             sign_out()
     else:
         if st.button("Sign in with Google", key="top_signin", type="primary", width="stretch"):
-            if _oauth_configured():
+            if _can_use_redirect_oauth():
                 st.login("google")
             else:
                 st.session_state["landing_section"] = "Sign in with Google"
@@ -477,7 +642,7 @@ def render_landing_hero_and_kpis(is_authenticated: bool):
                 st.rerun()
         else:
             if b1.button("Sign in with Google", key="lp_go_auth", type="primary", width="stretch"):
-                if _oauth_configured():
+                if _can_use_redirect_oauth():
                     st.login("google")
                 else:
                     st.session_state["landing_section"] = "Sign in with Google"
@@ -649,7 +814,7 @@ with st.sidebar:
     else:
         st.info("Sign in via OAuth 2.0 / OpenID Connect to access the interactive platform modules.")
         if st.button("Sign in with Google", key="sb_signin", type="primary", width="stretch"):
-            if _oauth_configured():
+            if _can_use_redirect_oauth():
                 st.login("google")
             else:
                 st.session_state["landing_section"] = "Sign in with Google"
