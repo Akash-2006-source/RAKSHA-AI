@@ -219,8 +219,6 @@ def show_fig(filename: str, caption: str = "", fallback_report_dir: bool = False
 
 D = load_data()
 SIM_RES = load_sim_results()
-DOCX_PATH = R / "RAKSHA_AI_Project_Report_FINAL.docx"
-DOCX_BYTES = DOCX_PATH.read_bytes() if DOCX_PATH.exists() else None
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +467,7 @@ def render_landing_hero_and_kpis(is_authenticated: bool):
             """,
             unsafe_allow_html=True,
         )
-        b1, b2, b3 = st.columns(3)
+        b1, b2 = st.columns(2)
         if is_authenticated:
             if b1.button("Open GIS Map", key="lp_go_gis", type="primary", width="stretch"):
                 st.session_state["nav_page"] = "GIS Map"
@@ -479,20 +477,14 @@ def render_landing_hero_and_kpis(is_authenticated: bool):
                 st.rerun()
         else:
             if b1.button("Sign in with Google", key="lp_go_auth", type="primary", width="stretch"):
-                st.session_state["landing_section"] = "Sign in with Google"
-                st.rerun()
+                if _oauth_configured():
+                    st.login("google")
+                else:
+                    st.session_state["landing_section"] = "Sign in with Google"
+                    st.rerun()
             if b2.button("View ML Benchmarks", key="lp_go_ml", type="secondary", width="stretch"):
                 st.session_state["landing_section"] = "ML Benchmarks"
                 st.rerun()
-        if DOCX_BYTES:
-            b3.download_button(
-                "Download Report (.docx)",
-                data=DOCX_BYTES,
-                file_name="RAKSHA_AI_Project_Report_FINAL.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key="lp_dl_docx",
-                width="stretch",
-            )
     with c2:
         show_fig("fig4_1_architecture.jpeg", "Layered architecture of RAKSHA AI")
 
@@ -1061,15 +1053,6 @@ else:
         st.title("Research Hub — Methodology & Documentation")
         render_landing_workflow_and_architecture()
         render_landing_gis_and_scope()
-        if DOCX_BYTES:
-            st.download_button(
-                "Download Full Report (.docx)",
-                data=DOCX_BYTES,
-                file_name="RAKSHA_AI_Project_Report_FINAL.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key="rh_dl_docx",
-                type="primary",
-            )
 
     # ====================================================================
     # 6. COMMUNITY HAZARD REPORTING
