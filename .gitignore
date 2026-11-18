@@ -1,0 +1,18 @@
+# Virtual environment & caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+
+# Secrets & local auth runtime files
+.streamlit/secrets.toml
+data/processed/users.db
+data/processed/oidc_rsa_key.json
+data/processed/uploads/
+
+# Large raw / intermediate data & binary docs
+data/raw/
+data/processed/trajectories.csv.gz
+reports/*.docx
+reports/report_figures/srm_logo.jpeg
